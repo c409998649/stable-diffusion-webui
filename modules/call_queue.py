@@ -7,6 +7,7 @@ import time
 from modules import shared, progress
 
 queue_lock = threading.Lock()
+tagger_queue_lock = threading.Lock()
 
 
 def wrap_queued_call(func):

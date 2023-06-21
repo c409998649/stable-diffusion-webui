@@ -1,34 +1,40 @@
 import base64
-import io
-import time
 import datetime
-import uvicorn
-import gradio as gr
-from threading import Lock
+import io
+import json
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.exceptions import HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
-
-import modules.shared as shared
-from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing
-from modules.api import models
-from modules.shared import opts
-from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
-from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
-from modules.textual_inversion.preprocess import preprocess
-from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
-from PIL import PngImagePlugin,Image
-from modules.sd_models import checkpoints_list, unload_model_weights, reload_model_weights
-from modules.sd_models_config import find_checkpoint_config_near_filename
-from modules.realesrgan_model import get_realesrgan_models
-from modules import devices
+from threading import Lock
 from typing import Dict, List, Any
+
+import gradio as gr
 import piexif
 import piexif.helper
+import requests
+import uvicorn
+from PIL import PngImagePlugin, Image
+from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+import modules.shared as shared
+from modules import devices
+from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing
+from modules.api import models
+from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
+from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
+from modules.realesrgan_model import get_realesrgan_models
+from modules.sd_models import checkpoints_list, unload_model_weights, reload_model_weights
+from modules.sd_models_config import find_checkpoint_config_near_filename
+from modules.shared import opts
+from modules.textual_inversion.preprocess import preprocess
+from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
 
 
 def upscaler_to_index(name: str):
@@ -173,6 +179,8 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
+        # 创建协程信号量
+        self.executor = ThreadPoolExecutor(max_workers=100)
         api_middleware(self.app)
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
@@ -374,14 +382,33 @@ class Api:
         script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner)
 
         send_images = args.pop('send_images', True)
-        args.pop('save_images', None)
+        save_images = args.pop('save_images', None)
+        is_async = args.pop('is_async', None)
+        callback_url = args.pop('callback_url', None)
 
+        # 异步执行
+        if is_async is True:
+            id = str(uuid.uuid1()).replace("-", "")
+            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, id)
+            return models.ImageToImageResponse(images=[""], parameters={}, info=id)
+        else:
+            b64images, processed = self.deal_with_image(args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url)
+            if not img2imgreq.include_init_images:
+                img2imgreq.init_images = None
+            img2imgreq.mask = None
+            return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+
+    def deal_with_image(self, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, id):
+        """
+        处理图片方法
+        """
         with self.queue_lock:
             p = StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)
             p.init_images = [decode_base64_to_image(x) for x in init_images]
             p.scripts = script_runner
-            p.outpath_grids = opts.outdir_img2img_grids
-            p.outpath_samples = opts.outdir_img2img_samples
+            if save_images is True:
+                p.outpath_grids = opts.outdir_img2img_grids
+                p.outpath_samples = opts.outdir_img2img_samples
 
             shared.state.begin()
             if selectable_scripts is not None:
@@ -392,13 +419,12 @@ class Api:
                 processed = process_images(p)
             shared.state.end()
 
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
-
-        if not img2imgreq.include_init_images:
-            img2imgreq.init_images = None
-            img2imgreq.mask = None
-
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+            if is_async is False:
+                b64images = list(map(encode_pil_to_base64, processed.images))
+                return b64images, processed
+            if len(callback_url) > 0:
+                images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
+                requests.post(callback_url, data=json.dumps({'id': id, 'images': images}), headers={'Content-Type': 'application/json'})
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
@@ -482,7 +508,7 @@ class Api:
             else:
                 raise HTTPException(status_code=404, detail="Model not found")
 
-        return models.InterrogateResponse(caption=processed)
+            return models.InterrogateResponse(caption=processed)
 
     def interruptapi(self):
         shared.state.interrupt()
