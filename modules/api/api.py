@@ -2,6 +2,7 @@ import base64
 import datetime
 import io
 import json
+import os.path
 import threading
 import time
 import uuid
@@ -24,7 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import modules.shared as shared
-from modules import devices
+from modules import devices, sd_models
 from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing
 from modules.api import models
 from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
@@ -385,11 +386,12 @@ class Api:
         save_images = args.pop('save_images', None)
         is_async = args.pop('is_async', None)
         callback_url = args.pop('callback_url', None)
+        model = args.pop('model', None)
 
         # 异步执行
         if is_async is True:
             id = str(uuid.uuid1()).replace("-", "")
-            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, id)
+            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id)
             return models.ImageToImageResponse(images=[""], parameters={}, info=id)
         else:
             b64images, processed = self.deal_with_image(args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url)
@@ -398,11 +400,16 @@ class Api:
             img2imgreq.mask = None
             return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
 
-    def deal_with_image(self, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, id):
+    def deal_with_image(self, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id):
         """
         处理图片方法
         """
         with self.queue_lock:
+            if len(model) > 0:
+                dir_path = os.path.dirname(os.path.abspath(__file__))
+                filename = os.path.join(dir_path, "../../models/Stable-diffusion", model)
+                checkpoint_info = sd_models.CheckpointInfo(filename)
+                sd_models.reload_model_weights(info=checkpoint_info)
             p = StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)
             p.init_images = [decode_base64_to_image(x) for x in init_images]
             p.scripts = script_runner
@@ -411,6 +418,7 @@ class Api:
                 p.outpath_samples = opts.outdir_img2img_samples
 
             shared.state.begin()
+            shared.state.task_id = id
             if selectable_scripts is not None:
                 p.script_args = script_args
                 processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
