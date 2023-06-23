@@ -184,6 +184,7 @@ class PNGInfoResponse(BaseModel):
 
 class ProgressRequest(BaseModel):
     skip_current_image: bool = Field(default=False, title="Skip current image", description="Skip current image serialization")
+    task_id: str = Field(default="", title="Task id", description="Task id is required")
 
 class ProgressResponse(BaseModel):
     progress: float = Field(title="Progress", description="The progress with a range of 0 to 1")
@@ -198,6 +199,13 @@ class InterrogateRequest(BaseModel):
 
 class InterrogateResponse(BaseModel):
     caption: str = Field(default=None, title="Caption", description="The generated caption for the image.")
+
+class InterruptRequest(BaseModel):
+    task_id: str = Field(default="", title="Task id", description="Task id is required")
+
+class InterruptResponse(BaseModel):
+    code: str
+    info: str
 
 class TrainResponse(BaseModel):
     info: str = Field(title="Train info", description="Response string from train embedding or hypernetwork task.")

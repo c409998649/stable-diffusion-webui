@@ -474,6 +474,9 @@ class Api:
     def progressapi(self, req: models.ProgressRequest = Depends()):
         # copy from check_progress_call of ui.py
 
+        if shared.state.task_id != req.task_id:
+            return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
+
         if shared.state.job_count == 0:
             return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
 
@@ -518,10 +521,11 @@ class Api:
 
             return models.InterrogateResponse(caption=processed)
 
-    def interruptapi(self):
+    def interruptapi(self, req: models.InterruptRequest):
+        if shared.state.task_id != req.task_id:
+            return models.InterruptResponse(code="200", info="error")
         shared.state.interrupt()
-
-        return {}
+        return models.InterruptResponse(code="100", info="success")
 
     def unloadapi(self):
         unload_model_weights()
