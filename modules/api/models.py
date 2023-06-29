@@ -127,6 +127,7 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "is_async", "type": bool, "default": False},
         {"key": "callback_url", "type": str, "default": ""},
         {"key": "model", "type": str, "default": ""},
+        {"key": "task_id", "type": str, "default": ""},
     ]
 ).generate_model()
 

@@ -387,14 +387,14 @@ class Api:
         is_async = args.pop('is_async', None)
         callback_url = args.pop('callback_url', None)
         model = args.pop('model', None)
+        task_id = args.pop('task_id', None)
 
         # 异步执行
         if is_async is True:
-            id = str(uuid.uuid1()).replace("-", "")
-            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id)
+            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, task_id)
             return models.ImageToImageResponse(images=[""], parameters={}, info=id)
         else:
-            b64images, processed = self.deal_with_image(args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url)
+            b64images, processed = self.deal_with_image(args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, task_id)
             if not img2imgreq.include_init_images:
                 img2imgreq.init_images = None
             img2imgreq.mask = None
