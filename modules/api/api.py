@@ -405,34 +405,38 @@ class Api:
         处理图片方法
         """
         with self.queue_lock:
-            if len(model) > 0:
-                dir_path = os.path.dirname(os.path.abspath(__file__))
+            try:
+                if len(model) > 0:
+                    dir_path = os.path.dirname(os.path.abspath(__file__))
                 filename = os.path.join(dir_path, "../../models/Stable-diffusion", model)
                 checkpoint_info = sd_models.CheckpointInfo(filename)
                 sd_models.reload_model_weights(info=checkpoint_info)
-            p = StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)
-            p.init_images = [decode_base64_to_image(x) for x in init_images]
-            p.scripts = script_runner
-            if save_images is True:
-                p.outpath_grids = opts.outdir_img2img_grids
-                p.outpath_samples = opts.outdir_img2img_samples
+                p = StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)
+                p.init_images = [decode_base64_to_image(x) for x in init_images]
+                p.scripts = script_runner
+                if save_images is True:
+                    p.outpath_grids = opts.outdir_img2img_grids
+                    p.outpath_samples = opts.outdir_img2img_samples
 
-            shared.state.begin()
-            shared.state.task_id = id
-            if selectable_scripts is not None:
-                p.script_args = script_args
-                processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
-            else:
-                p.script_args = tuple(script_args) # Need to pass args as tuple here
-                processed = process_images(p)
-            shared.state.end()
+                shared.state.begin()
+                shared.state.task_id = id
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args) # Need to pass args as tuple here
+                    processed = process_images(p)
+                shared.state.end()
 
-            if is_async is False:
-                b64images = list(map(encode_pil_to_base64, processed.images))
-                return b64images, processed
-            if len(callback_url) > 0:
-                images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
-                requests.post(callback_url, data=json.dumps({'id': id, 'images': images}), headers={'Content-Type': 'application/json'})
+                if is_async is False:
+                    b64images = list(map(encode_pil_to_base64, processed.images))
+                    return b64images, processed
+                if len(callback_url) > 0:
+                    images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
+                    requests.post(callback_url, data=json.dumps({'id': id, 'images': images, 'success': 'true'}), headers={'Content-Type': 'application/json'})
+            except Exception as e:
+                print(e)
+                requests.post(callback_url, data=json.dumps({'id': id, 'images': [], 'success': 'false'}), headers={'Content-Type': 'application/json'})
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
