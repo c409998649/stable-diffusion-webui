@@ -327,26 +327,53 @@ class Api:
         script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner)
 
         send_images = args.pop('send_images', True)
-        args.pop('save_images', None)
+        save_images = args.pop('save_images', None)
+        is_async = args.pop('is_async', None)
+        callback_url = args.pop('callback_url', None)
+        model = args.pop('model', None)
+        task_id = args.pop('task_id', None)
+        # 异步执行
+        if is_async is True:
+            self.executor.submit(self.deal_with_text_image, args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, task_id)
+            return models.TextToImageResponse(images=[""], parameters={}, info=task_id)
+        else:
+            b64images, processed = self.deal_with_text_image(args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, task_id)
+            return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
 
+
+    def deal_with_text_image(self, args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id):
+        """
+        处理图片方法
+        """
         with self.queue_lock:
-            p = StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)
-            p.scripts = script_runner
-            p.outpath_grids = opts.outdir_txt2img_grids
-            p.outpath_samples = opts.outdir_txt2img_samples
-
-            shared.state.begin()
-            if selectable_scripts is not None:
-                p.script_args = script_args
-                processed = scripts.scripts_txt2img.run(p, *p.script_args) # Need to pass args as list here
-            else:
-                p.script_args = tuple(script_args) # Need to pass args as tuple here
-                processed = process_images(p)
-            shared.state.end()
-
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
-
-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+            try:
+                if len(model) > 0:
+                    dir_path = os.path.dirname(os.path.abspath(__file__))
+                filename = os.path.join(dir_path, "../../models/Stable-diffusion", model)
+                checkpoint_info = sd_models.CheckpointInfo(filename)
+                sd_models.reload_model_weights(info=checkpoint_info)
+                p = StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)
+                p.scripts = script_runner
+                if save_images is True:
+                    p.outpath_grids = opts.outdir_txt2img_grids
+                    p.outpath_samples = opts.outdir_txt2img_samples
+                shared.state.begin()
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_txt2img.run(p, *p.script_args) # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args) # Need to pass args as tuple here
+                    processed = process_images(p)
+                shared.state.end()
+                if is_async is False:
+                    b64images = list(map(encode_pil_to_base64, processed.images))
+                    return b64images, processed
+                if len(callback_url) > 0:
+                    images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
+                    requests.post(callback_url, data=json.dumps({'id': id, 'images': images, 'success': 'true'}), headers={'Content-Type': 'application/json'})
+            except Exception as e:
+                print(e)
+                requests.post(callback_url, data=json.dumps({'id': id, 'images': [], 'success': 'false'}), headers={'Content-Type': 'application/json'})
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images
