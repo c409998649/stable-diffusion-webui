@@ -1,8 +1,11 @@
 import base64
 import io
+import json
 import os
 import time
 import datetime
+
+import requests
 import uvicorn
 import gradio as gr
 from threading import Lock
@@ -13,9 +16,10 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
+from concurrent.futures import ThreadPoolExecutor
 
 import modules.shared as shared
-from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart
+from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, sd_models
 from modules.api import models
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
@@ -173,13 +177,15 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
+        # 创建协程信号量
+        self.executor = ThreadPoolExecutor(max_workers=100)
         api_middleware(self.app)
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
         self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=models.PNGInfoResponse)
-        self.add_api_route("/sdapi/v1/progress", self.progressapi, methods=["GET"], response_model=models.ProgressResponse)
+        self.add_api_route("/sdapi/v1/progress", self.progressapi, methods=["POST"], response_model=models.ProgressResponse)
         self.add_api_route("/sdapi/v1/interrogate", self.interrogateapi, methods=["POST"])
         self.add_api_route("/sdapi/v1/interrupt", self.interruptapi, methods=["POST"])
         self.add_api_route("/sdapi/v1/skip", self.skip, methods=["POST"])
@@ -325,28 +331,55 @@ class Api:
         script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner)
 
         send_images = args.pop('send_images', True)
-        args.pop('save_images', None)
+        save_images = args.pop('save_images', None)
+        is_async = args.pop('is_async', None)
+        callback_url = args.pop('callback_url', None)
+        model = args.pop('model', None)
+        task_id = args.pop('task_id', None)
+        # 异步执行
+        if is_async is True:
+            self.executor.submit(self.deal_with_text_image, args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, task_id)
+            return models.TextToImageResponse(images=[""], parameters={}, info=task_id)
+        else:
+            b64images, processed = self.deal_with_text_image(args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, task_id)
+            return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
 
+
+    def deal_with_text_image(self, args, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id):
+        """
+        处理图片方法
+        """
         with self.queue_lock:
-            with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
-                p.scripts = script_runner
-                p.outpath_grids = opts.outdir_txt2img_grids
-                p.outpath_samples = opts.outdir_txt2img_samples
+            try:
+                if len(model) > 0:
+                    dir_path = os.path.dirname(os.path.abspath(__file__))
+                filename = os.path.join(dir_path, "../../models/Stable-diffusion", model)
+                checkpoint_info = sd_models.CheckpointInfo(filename)
+                sd_models.reload_model_weights(info=checkpoint_info)
+                with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
+                    p.scripts = script_runner
+                    p.outpath_grids = opts.outdir_txt2img_grids
+                    p.outpath_samples = opts.outdir_txt2img_samples
 
-                try:
-                    shared.state.begin(job="scripts_txt2img")
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_txt2img.run(p, *p.script_args) # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args) # Need to pass args as tuple here
-                        processed = process_images(p)
-                finally:
-                    shared.state.end()
-
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
-
-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+                    try:
+                        shared.state.begin(job="scripts_txt2img")
+                        if selectable_scripts is not None:
+                            p.script_args = script_args
+                            processed = scripts.scripts_txt2img.run(p, *p.script_args) # Need to pass args as list here
+                        else:
+                            p.script_args = tuple(script_args) # Need to pass args as tuple here
+                            processed = process_images(p)
+                    finally:
+                        shared.state.end()
+                if is_async is False:
+                    b64images = list(map(encode_pil_to_base64, processed.images))
+                    return b64images, processed
+                if len(callback_url) > 0:
+                    images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
+                    requests.post(callback_url, data=json.dumps({'id': id, 'images': images, 'success': 'true'}), headers={'Content-Type': 'application/json'})
+            except Exception as e:
+                print(e)
+                requests.post(callback_url, data=json.dumps({'id': id, 'images': [], 'success': 'false'}), headers={'Content-Type': 'application/json'})
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images
@@ -383,33 +416,61 @@ class Api:
         script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner)
 
         send_images = args.pop('send_images', True)
-        args.pop('save_images', None)
+        save_images = args.pop('save_images', None)
+        is_async = args.pop('is_async', None)
+        callback_url = args.pop('callback_url', None)
+        model = args.pop('model', None)
+        task_id = args.pop('task_id', None)
 
-        with self.queue_lock:
-            with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
-                p.init_images = [decode_base64_to_image(x) for x in init_images]
-                p.scripts = script_runner
-                p.outpath_grids = opts.outdir_img2img_grids
-                p.outpath_samples = opts.outdir_img2img_samples
-
-                try:
-                    shared.state.begin(job="scripts_img2img")
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args) # Need to pass args as tuple here
-                        processed = process_images(p)
-                finally:
-                    shared.state.end()
-
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
-
-        if not img2imgreq.include_init_images:
-            img2imgreq.init_images = None
+        # 异步执行
+        if is_async is True:
+            self.executor.submit(self.deal_with_image, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, task_id)
+            return models.ImageToImageResponse(images=[""], parameters={}, info=task_id)
+        else:
+            b64images, processed = self.deal_with_image(args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, task_id)
+            if not img2imgreq.include_init_images:
+                img2imgreq.init_images = None
             img2imgreq.mask = None
+            return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
 
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+
+    def deal_with_image(self, args, init_images, script_runner, selectable_scripts, script_args, save_images, is_async, callback_url, model, id):
+        """
+        处理图片方法
+        """
+        with self.queue_lock:
+            try:
+                if len(model) > 0:
+                    dir_path = os.path.dirname(os.path.abspath(__file__))
+                filename = os.path.join(dir_path, "../../models/Stable-diffusion", model)
+                checkpoint_info = sd_models.CheckpointInfo(filename)
+                sd_models.reload_model_weights(info=checkpoint_info)
+                with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
+                    p.init_images = [decode_base64_to_image(x) for x in init_images]
+                    p.scripts = script_runner
+                    p.outpath_grids = opts.outdir_img2img_grids
+                    p.outpath_samples = opts.outdir_img2img_samples
+
+                    try:
+                        shared.state.begin(job="scripts_img2img")
+                        if selectable_scripts is not None:
+                            p.script_args = script_args
+                            processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
+                        else:
+                            p.script_args = tuple(script_args) # Need to pass args as tuple here
+                            processed = process_images(p)
+                    finally:
+                        shared.state.end()
+
+                if is_async is False:
+                    b64images = list(map(encode_pil_to_base64, processed.images))
+                    return b64images, processed
+                if len(callback_url) > 0:
+                    images = [encode_pil_to_base64(image).decode("utf-8") for image in processed.images]
+                    requests.post(callback_url, data=json.dumps({'id': id, 'images': images, 'success': 'true'}), headers={'Content-Type': 'application/json'})
+            except Exception as e:
+                print(e)
+                requests.post(callback_url, data=json.dumps({'id': id, 'images': [], 'success': 'false'}), headers={'Content-Type': 'application/json'})
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
@@ -448,10 +509,13 @@ class Api:
 
         return models.PNGInfoResponse(info=geninfo, items=items)
 
-    def progressapi(self, req: models.ProgressRequest = Depends()):
+    def progressapi(self, req: models.ProgressRequest):
         # copy from check_progress_call of ui.py
 
         if shared.state.job_count == 0:
+            return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
+
+        if shared.state.task_id != req.task_id:
             return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
 
         # avoid dividing zero
@@ -495,10 +559,11 @@ class Api:
 
         return models.InterrogateResponse(caption=processed)
 
-    def interruptapi(self):
+    def interruptapi(self, req: models.InterruptRequest):
+        if shared.state.task_id != req.task_id:
+            return models.InterruptResponse(code="200", info="error")
         shared.state.interrupt()
-
-        return {}
+        return models.InterruptResponse(code="100", info="success")
 
     def unloadapi(self):
         unload_model_weights()
